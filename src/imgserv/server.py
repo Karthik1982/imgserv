@@ -7,11 +7,136 @@ A simple HTTP server that serves images from a directory as an auto-advancing sl
 import os
 import json
 import mimetypes
+import time
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import unquote
+from urllib.parse import unquote, quote
+try:
+    from urllib.request import urlopen
+    from urllib.error import URLError
+except ImportError:
+    from urllib2 import urlopen, URLError
+
+# Try to import Pillow for EXIF reading
+try:
+    from PIL import Image
+    from PIL.ExifTags import TAGS, GPSTAGS
+    PILLOW_AVAILABLE = True
+except ImportError:
+    PILLOW_AVAILABLE = False
 
 # Supported image extensions
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
+
+# Weather cache (to avoid excessive API calls)
+weather_cache = {
+    'data': None,
+    'timestamp': 0
+}
+WEATHER_CACHE_DURATION = 600  # 10 minutes in seconds
+
+# Metadata cache (to avoid re-reading EXIF for same image)
+metadata_cache = {}
+
+
+def convert_gps_to_decimal(gps_coords, gps_ref):
+    """Convert GPS coordinates from EXIF format to decimal degrees."""
+    try:
+        degrees = float(gps_coords[0])
+        minutes = float(gps_coords[1])
+        seconds = float(gps_coords[2])
+        
+        decimal = degrees + (minutes / 60.0) + (seconds / 3600.0)
+        
+        if gps_ref in ['S', 'W']:
+            decimal = -decimal
+        
+        return decimal
+    except (TypeError, IndexError, ValueError):
+        return None
+
+
+def reverse_geocode(lat, lon):
+    """Reverse geocode coordinates to location name using OpenStreetMap Nominatim."""
+    try:
+        url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}&zoom=10"
+        response = urlopen(url, timeout=5)
+        data = json.loads(response.read().decode('utf-8'))
+        
+        address = data.get('address', {})
+        
+        # Build location string from address components
+        city = address.get('city') or address.get('town') or address.get('village') or address.get('hamlet')
+        state = address.get('state')
+        country = address.get('country')
+        
+        parts = []
+        if city:
+            parts.append(city)
+        if state:
+            parts.append(state)
+        if not parts and country:
+            parts.append(country)
+        
+        return ', '.join(parts) if parts else None
+    except Exception:
+        # If reverse geocoding fails, return coordinates
+        return f"{lat:.4f}, {lon:.4f}"
+
+
+def get_exif_data(filepath):
+    """Extract date and GPS location from image EXIF metadata."""
+    if not PILLOW_AVAILABLE:
+        return {'date': None, 'location': None}
+    
+    # Check cache
+    if filepath in metadata_cache:
+        return metadata_cache[filepath]
+    
+    result = {'date': None, 'location': None}
+    
+    try:
+        img = Image.open(filepath)
+        exif_data = img._getexif()
+        
+        if exif_data:
+            # Extract date taken (tag 36867 = DateTimeOriginal)
+            date_taken = exif_data.get(36867)
+            if date_taken:
+                try:
+                    # Parse EXIF date format "YYYY:MM:DD HH:MM:SS"
+                    dt = datetime.strptime(date_taken, "%Y:%m:%d %H:%M:%S")
+                    result['date'] = dt.strftime("%B %d, %Y")  # "January 15, 2024"
+                except ValueError:
+                    result['date'] = date_taken
+            
+            # Extract GPS info (tag 34853 = GPSInfo)
+            gps_info = exif_data.get(34853)
+            if gps_info:
+                lat = None
+                lon = None
+                
+                # GPS tags: 1=LatitudeRef, 2=Latitude, 3=LongitudeRef, 4=Longitude
+                lat_ref = gps_info.get(1)
+                lat_coords = gps_info.get(2)
+                lon_ref = gps_info.get(3)
+                lon_coords = gps_info.get(4)
+                
+                if lat_coords and lon_coords:
+                    lat = convert_gps_to_decimal(lat_coords, lat_ref)
+                    lon = convert_gps_to_decimal(lon_coords, lon_ref)
+                
+                if lat is not None and lon is not None:
+                    result['location'] = reverse_geocode(lat, lon)
+        
+        img.close()
+    except Exception as e:
+        print(f"Error reading EXIF from {filepath}: {e}")
+    
+    # Cache the result
+    metadata_cache[filepath] = result
+    return result
+
 
 # HTML template with placeholder for interval
 HTML_TEMPLATE = '''<!DOCTYPE html>
@@ -31,24 +156,487 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             height: 100vh;
             overflow: hidden;
         }}
+        #photo-container {{
+            position: relative;
+            width: 100%;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden;
+        }}
         img {{
             max-width: 100%;
             max-height: 100vh;
             object-fit: contain;
+            position: relative;
+            left: 0;
         }}
         .loading {{
             color: #fff;
             font-family: sans-serif;
             font-size: 24px;
         }}
+        #clock {{
+            position: fixed;
+            bottom: 55px;
+            left: 20px;
+            color: #fff;
+            font-family: 'Courier New', monospace;
+            font-size: 32px;
+            font-weight: bold;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+        }}
+        #weather {{
+            position: fixed;
+            bottom: 20px;
+            left: 20px;
+            color: white;
+            font-size: 20px;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.8);
+            display: flex;
+            align-items: center;
+        }}
+        #weather img {{
+            width: 40px;
+            height: 40px;
+            vertical-align: middle;
+            margin-right: 5px;
+        }}
+        #photo-metadata {{
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            color: #f8f8ff;
+            text-shadow: 
+                0 1px 0 rgba(255, 255, 255, 0.4),
+                0 -1px 1px rgba(0, 0, 0, 0.3),
+                2px 2px 4px rgba(0, 0, 0, 0.6);
+            z-index: 1000;
+            text-align: right;
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+            font-weight: 500;
+            letter-spacing: 0.5px;
+        }}
+        #photo-metadata .meta-date {{
+            font-size: 29px;
+            margin-bottom: 5px;
+        }}
+        #photo-metadata .meta-location {{
+            font-size: 24px;
+            opacity: 0.95;
+            color: #fff;
+            font-family: sans-serif;
+            font-size: 24px;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+        }}
+        #weather img {{
+            width: 40px;
+            height: 40px;
+            margin-right: 5px;
+            filter: drop-shadow(2px 2px 2px rgba(0, 0, 0, 0.8));
+        }}
+        #sleep-overlay {{
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: #000;
+            z-index: 998;
+            display: none;
+        }}
+        .sleep-mode #clock {{
+            opacity: 0.3;
+        }}
+        .sleep-mode #weather {{
+            display: none;
+        }}
+        .sleep-mode #photo-metadata {{
+            display: none;
+        }}
+        .sleep-mode #photo-container {{
+            display: none !important;
+        }}
+        .sleep-mode #loading {{
+            display: none !important;
+        }}
     </style>
 </head>
 <body>
+    <div id="sleep-overlay"></div>
     <div id="loading" class="loading">Loading images...</div>
-    <img id="photo" src="" alt="Photo" style="display:none;">
+    <div id="photo-container" style="display:none;">
+        <img id="photo" src="" alt="Photo">
+    </div>
+    <div id="clock"></div>
+    <div id="weather"></div>
+    <div id="photo-metadata"></div>
     <script>
-        var currentImage = '';
+        // Weather display
+        function updateWeather() {{
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', '/api/weather', true);
+            xhr.onreadystatechange = function() {{
+                if (xhr.readyState === 4 && xhr.status === 200) {{
+                    var data = JSON.parse(xhr.responseText);
+                    if (data.temp !== undefined) {{
+                        var html = '';
+                        if (data.icon) {{
+                            var iconUrl = 'https://openweathermap.org/img/wn/' + data.icon + '@2x.png';
+                            html += '<img src="' + iconUrl + '" alt="weather" onerror="this.style.display=&quot;none&quot;">';
+                        }}
+                        html += data.temp + '°F ' + data.description;
+                        document.getElementById('weather').innerHTML = html;
+                    }}
+                }}
+            }};
+            xhr.send();
+        }}
+        updateWeather();
+        setInterval(updateWeather, 600000);  // Update every 10 minutes
+        
+        // Photo metadata display
+        function updateMetadata(filename) {{
+            var metadataDiv = document.getElementById('photo-metadata');
+            if (!filename) {{
+                metadataDiv.innerHTML = '';
+                return;
+            }}
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', '/api/metadata/' + encodeURIComponent(filename), true);
+            xhr.onreadystatechange = function() {{
+                if (xhr.readyState === 4 && xhr.status === 200) {{
+                    var data = JSON.parse(xhr.responseText);
+                    var html = '';
+                    if (data.date) {{
+                        html += '<div class="meta-date">' + data.date + '</div>';
+                    }}
+                    if (data.location) {{
+                        html += '<div class="meta-location">' + data.location + '</div>';
+                    }}
+                    metadataDiv.innerHTML = html;
+                }}
+            }};
+            xhr.send();
+        }}
+        
+        // Digital clock (12-hour format)
+        function updateClock() {{
+            var now = new Date();
+            var hours = now.getHours();
+            var minutes = now.getMinutes();
+            var ampm = hours >= 12 ? 'PM' : 'AM';
+            
+            // Convert to 12-hour format
+            hours = hours % 12;
+            if (hours === 0) hours = 12;
+            
+            // Pad with leading zeros
+            if (hours < 10) hours = '0' + hours;
+            if (minutes < 10) minutes = '0' + minutes;
+            
+            document.getElementById('clock').innerHTML = hours + ':' + minutes + ' ' + ampm;
+        }}
+        updateClock();
+        setInterval(updateClock, 1000);
+        
+        // Sleep mode check
+        var isSleeping = false;
+        
+        function timeToMinutes(timeStr) {{
+            var parts = timeStr.split(':');
+            return parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10);
+        }}
+        
+        function isInSleepWindow(currentTime, sleepStart, sleepEnd) {{
+            var current = timeToMinutes(currentTime);
+            var start = timeToMinutes(sleepStart);
+            var end = timeToMinutes(sleepEnd);
+            
+            // If start equals end, sleep mode is disabled
+            if (start === end) return false;
+            
+            // Handle overnight sleep (e.g., 23:00 to 06:00)
+            if (start > end) {{
+                return current >= start || current < end;
+            }} else {{
+                return current >= start && current < end;
+            }}
+        }}
+        
+        function checkSleepMode() {{
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', '/api/schedule', true);
+            xhr.onreadystatechange = function() {{
+                if (xhr.readyState === 4 && xhr.status === 200) {{
+                    var data = JSON.parse(xhr.responseText);
+                    var shouldSleep = isInSleepWindow(data.server_time, data.sleep_start, data.sleep_end);
+                    
+                    if (shouldSleep && !isSleeping) {{
+                        // Enter sleep mode
+                        isSleeping = true;
+                        document.body.classList.add('sleep-mode');
+                        document.getElementById('sleep-overlay').style.display = 'block';
+                    }} else if (!shouldSleep && isSleeping) {{
+                        // Exit sleep mode
+                        isSleeping = false;
+                        document.body.classList.remove('sleep-mode');
+                        document.getElementById('sleep-overlay').style.display = 'none';
+                    }}
+                }}
+            }};
+            xhr.send();
+        }}
+        
+        checkSleepMode();
+        setInterval(checkSleepMode, 60000);  // Check every minute
+    </script>
+    <script>
         var interval = {interval};
+        var isFirstImage = true;
+        var shuffledImages = [];
+        var shuffleIndex = 0;
+        var lastServerImages = [];
+        var effects = ['fade', 'slideLeft', 'zoomIn', 'flip'];
+        
+        // Helper: Set opacity (cross-browser)
+        function setOpacity(element, value) {{
+            element.style.opacity = value / 100;
+            element.style.filter = 'alpha(opacity=' + value + ')';
+        }}
+        
+        // Helper: Set scale using width percentage (cross-browser)
+        function setScale(element, value, originalWidth) {{
+            if (originalWidth) {{
+                element.style.width = (originalWidth * value / 100) + 'px';
+            }}
+        }}
+        
+        // Fisher-Yates shuffle algorithm
+        function shuffleArray(array) {{
+            var arr = array.slice();
+            for (var i = arr.length - 1; i > 0; i--) {{
+                var j = Math.floor(Math.random() * (i + 1));
+                var temp = arr[i];
+                arr[i] = arr[j];
+                arr[j] = temp;
+            }}
+            return arr;
+        }}
+        
+        // Check if arrays are equal
+        function arraysEqual(a, b) {{
+            if (a.length !== b.length) return false;
+            for (var i = 0; i < a.length; i++) {{
+                if (a[i] !== b[i]) return false;
+            }}
+            return true;
+        }}
+        
+        // Get random effect
+        function getRandomEffect() {{
+            return effects[Math.floor(Math.random() * effects.length)];
+        }}
+        
+        // Effect: Fade Out
+        function fadeOut(element, callback) {{
+            var opacity = 100;
+            var timer = setInterval(function() {{
+                opacity -= 5;
+                if (opacity <= 0) {{
+                    clearInterval(timer);
+                    setOpacity(element, 0);
+                    if (callback) callback();
+                }} else {{
+                    setOpacity(element, opacity);
+                }}
+            }}, 50);
+        }}
+        
+        // Effect: Fade In
+        function fadeIn(element, callback) {{
+            var opacity = 0;
+            var timer = setInterval(function() {{
+                opacity += 5;
+                if (opacity >= 100) {{
+                    clearInterval(timer);
+                    setOpacity(element, 100);
+                    if (callback) callback();
+                }} else {{
+                    setOpacity(element, opacity);
+                }}
+            }}, 50);
+        }}
+        
+        // Effect: Slide Left Out (slide to left)
+        function slideLeftOut(element, callback) {{
+            var pos = 0;
+            var timer = setInterval(function() {{
+                pos -= 5;
+                if (pos <= -100) {{
+                    clearInterval(timer);
+                    element.style.left = '-100%';
+                    setOpacity(element, 0);
+                    if (callback) callback();
+                }} else {{
+                    element.style.left = pos + '%';
+                }}
+            }}, 25);
+        }}
+        
+        // Effect: Slide Left In (slide from right)
+        function slideLeftIn(element, callback) {{
+            element.style.left = '100%';
+            setOpacity(element, 100);
+            var pos = 100;
+            var timer = setInterval(function() {{
+                pos -= 5;
+                if (pos <= 0) {{
+                    clearInterval(timer);
+                    element.style.left = '0';
+                    if (callback) callback();
+                }} else {{
+                    element.style.left = pos + '%';
+                }}
+            }}, 25);
+        }}
+        
+        // Effect: Zoom Out (shrink)
+        function zoomOut(element, callback) {{
+            var scale = 100;
+            var origWidth = element.offsetWidth;
+            var timer = setInterval(function() {{
+                scale -= 5;
+                if (scale <= 0) {{
+                    clearInterval(timer);
+                    element.style.width = '';
+                    setOpacity(element, 0);
+                    if (callback) callback();
+                }} else {{
+                    setScale(element, scale, origWidth);
+                    setOpacity(element, scale);
+                }}
+            }}, 40);
+        }}
+        
+        // Effect: Zoom In (grow)
+        function zoomIn(element, callback) {{
+            setOpacity(element, 0);
+            element.style.width = '0';
+            var scale = 0;
+            var targetWidth = null;
+            var timer = setInterval(function() {{
+                if (targetWidth === null) {{
+                    element.style.width = '';
+                    targetWidth = element.offsetWidth;
+                    element.style.width = '0';
+                }}
+                scale += 5;
+                if (scale >= 100) {{
+                    clearInterval(timer);
+                    element.style.width = '';
+                    setOpacity(element, 100);
+                    if (callback) callback();
+                }} else {{
+                    setScale(element, scale, targetWidth);
+                    setOpacity(element, scale);
+                }}
+            }}, 40);
+        }}
+        
+        // Effect: Flip Out (squeeze horizontally)
+        function flipOut(element, callback) {{
+            var scale = 100;
+            var origWidth = element.offsetWidth;
+            var timer = setInterval(function() {{
+                scale -= 10;
+                if (scale <= 0) {{
+                    clearInterval(timer);
+                    element.style.width = '0';
+                    if (callback) callback();
+                }} else {{
+                    setScale(element, scale, origWidth);
+                }}
+            }}, 30);
+        }}
+        
+        // Effect: Flip In (expand horizontally)
+        function flipIn(element, callback) {{
+            element.style.width = '0';
+            setOpacity(element, 100);
+            var scale = 0;
+            var targetWidth = null;
+            var timer = setInterval(function() {{
+                if (targetWidth === null) {{
+                    element.style.width = '';
+                    targetWidth = element.offsetWidth;
+                    element.style.width = '0';
+                }}
+                scale += 10;
+                if (scale >= 100) {{
+                    clearInterval(timer);
+                    element.style.width = '';
+                    if (callback) callback();
+                }} else {{
+                    setScale(element, scale, targetWidth);
+                }}
+            }}, 30);
+        }}
+        
+        // Apply transition out based on effect type
+        function transitionOut(element, effect, callback) {{
+            if (effect === 'fade') {{
+                fadeOut(element, callback);
+            }} else if (effect === 'slideLeft') {{
+                slideLeftOut(element, callback);
+            }} else if (effect === 'zoomIn') {{
+                zoomOut(element, callback);
+            }} else if (effect === 'flip') {{
+                flipOut(element, callback);
+            }} else {{
+                fadeOut(element, callback);
+            }}
+        }}
+        
+        // Apply transition in based on effect type
+        function transitionIn(element, effect, callback) {{
+            if (effect === 'fade') {{
+                fadeIn(element, callback);
+            }} else if (effect === 'slideLeft') {{
+                slideLeftIn(element, callback);
+            }} else if (effect === 'zoomIn') {{
+                zoomIn(element, callback);
+            }} else if (effect === 'flip') {{
+                flipIn(element, callback);
+            }} else {{
+                fadeIn(element, callback);
+            }}
+        }}
+        
+        // Get next image from shuffled list
+        function getNextImage(serverImages) {{
+            // Check if server images changed
+            if (!arraysEqual(serverImages, lastServerImages)) {{
+                lastServerImages = serverImages.slice();
+                shuffledImages = shuffleArray(serverImages);
+                shuffleIndex = 0;
+            }}
+            
+            // If we've shown all images, reshuffle
+            if (shuffleIndex >= shuffledImages.length) {{
+                shuffledImages = shuffleArray(serverImages);
+                shuffleIndex = 0;
+            }}
+            
+            var img = shuffledImages[shuffleIndex];
+            shuffleIndex++;
+            return img;
+        }}
         
         function fetchAndShow() {{
             var xhr = new XMLHttpRequest();
@@ -58,24 +646,38 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     var images = JSON.parse(xhr.responseText);
                     if (images.length > 0) {{
                         document.getElementById('loading').style.display = 'none';
-                        document.getElementById('photo').style.display = 'block';
+                        var container = document.getElementById('photo-container');
+                        var photo = document.getElementById('photo');
+                        container.style.display = 'flex';
                         
-                        var nextIndex = 0;
-                        if (currentImage) {{
-                            var idx = images.indexOf(currentImage);
-                            if (idx >= 0) {{
-                                nextIndex = (idx + 1) % images.length;
-                            }}
+                        var nextImage = getNextImage(images);
+                        var effect = getRandomEffect();
+                        
+                        if (isFirstImage) {{
+                            setOpacity(photo, 0);
+                            photo.onload = function() {{
+                                transitionIn(photo, effect);
+                            }};
+                            photo.src = '/image/' + encodeURIComponent(nextImage);
+                            updateMetadata(nextImage);
+                            isFirstImage = false;
+                            setTimeout(fetchAndShow, interval);
+                        }} else {{
+                            transitionOut(photo, effect, function() {{
+                                photo.onload = function() {{
+                                    transitionIn(photo, effect);
+                                }};
+                                photo.src = '/image/' + encodeURIComponent(nextImage);
+                                updateMetadata(nextImage);
+                                setTimeout(fetchAndShow, interval);
+                            }});
                         }}
-                        
-                        currentImage = images[nextIndex];
-                        document.getElementById('photo').src = '/image/' + encodeURIComponent(currentImage);
                     }} else {{
                         document.getElementById('loading').style.display = 'block';
-                        document.getElementById('photo').style.display = 'none';
+                        document.getElementById('photo-container').style.display = 'none';
                         document.getElementById('loading').innerHTML = 'No images found';
+                        setTimeout(fetchAndShow, interval);
                     }}
-                    setTimeout(fetchAndShow, interval);
                 }}
             }};
             xhr.send();
@@ -103,7 +705,44 @@ def get_image_files(directory):
     return files
 
 
-def create_handler(image_dir, interval_ms):
+def fetch_weather(api_key, city):
+    """Fetch weather data from OpenWeather API with caching."""
+    global weather_cache
+    
+    # Check cache
+    current_time = time.time()
+    if weather_cache['data'] and (current_time - weather_cache['timestamp']) < WEATHER_CACHE_DURATION:
+        return weather_cache['data']
+    
+    # Fetch from API
+    try:
+        encoded_city = quote(city)
+        url = f"https://api.openweathermap.org/data/2.5/weather?q={encoded_city}&appid={api_key}&units=imperial"
+        response = urlopen(url, timeout=10)
+        data = json.loads(response.read().decode('utf-8'))
+        
+        # Extract relevant data
+        weather_data = {
+            'temp': round(data['main']['temp']),
+            'description': data['weather'][0]['main'],
+            'icon': data['weather'][0]['icon'],
+            'city': data['name']
+        }
+        
+        # Update cache
+        weather_cache['data'] = weather_data
+        weather_cache['timestamp'] = current_time
+        
+        return weather_data
+    except Exception as e:
+        print(f"Weather API error: {e}")
+        # Return cached data if available, even if expired
+        if weather_cache['data']:
+            return weather_cache['data']
+        return None
+
+
+def create_handler(image_dir, interval_ms, weather_api_key=None, city=None, sleep_start='23:00', sleep_end='06:00'):
     """Create a request handler class with the specified configuration."""
     
     class PhotoFrameHandler(BaseHTTPRequestHandler):
@@ -129,6 +768,13 @@ def create_handler(image_dir, interval_ms):
                 self.serve_index()
             elif path == '/api/images':
                 self.serve_image_list()
+            elif path == '/api/weather':
+                self.serve_weather()
+            elif path == '/api/schedule':
+                self.serve_schedule()
+            elif path.startswith('/api/metadata/'):
+                filename = path[14:]  # Remove '/api/metadata/' prefix
+                self.serve_metadata(filename)
             elif path.startswith('/image/'):
                 filename = path[7:]  # Remove '/image/' prefix
                 self.serve_image(filename)
@@ -146,6 +792,53 @@ def create_handler(image_dir, interval_ms):
             """Serve the list of available images as JSON."""
             images = get_image_files(image_dir)
             content = json.dumps(images).encode('utf-8')
+            self.send_response_headers(200, 'application/json', len(content))
+            self.wfile.write(content)
+        
+        def serve_weather(self):
+            """Serve current weather data as JSON."""
+            if not weather_api_key or not city:
+                content = json.dumps({'error': 'Weather not configured'}).encode('utf-8')
+                self.send_response_headers(200, 'application/json', len(content))
+                self.wfile.write(content)
+                return
+            
+            weather_data = fetch_weather(weather_api_key, city)
+            if weather_data:
+                content = json.dumps(weather_data).encode('utf-8')
+                self.send_response_headers(200, 'application/json', len(content))
+                self.wfile.write(content)
+            else:
+                content = json.dumps({'error': 'Failed to fetch weather'}).encode('utf-8')
+                self.send_response_headers(500, 'application/json', len(content))
+                self.wfile.write(content)
+        
+        def serve_schedule(self):
+            """Serve sleep schedule and current server time as JSON."""
+            now = datetime.now()
+            server_time = now.strftime('%H:%M')
+            
+            schedule_data = {
+                'sleep_start': sleep_start,
+                'sleep_end': sleep_end,
+                'server_time': server_time
+            }
+            content = json.dumps(schedule_data).encode('utf-8')
+            self.send_response_headers(200, 'application/json', len(content))
+            self.wfile.write(content)
+        
+        def serve_metadata(self, filename):
+            """Serve EXIF metadata for a specific image as JSON."""
+            # Security: prevent directory traversal
+            filename = os.path.basename(filename)
+            filepath = os.path.join(image_dir, filename)
+            
+            if not os.path.exists(filepath):
+                self.send_error(404, 'Image not found')
+                return
+            
+            metadata = get_exif_data(filepath)
+            content = json.dumps(metadata).encode('utf-8')
             self.send_response_headers(200, 'application/json', len(content))
             self.wfile.write(content)
         
@@ -182,7 +875,8 @@ def create_handler(image_dir, interval_ms):
     return PhotoFrameHandler
 
 
-def run_server(image_dir, port=8000, interval=5):
+def run_server(image_dir, port=8000, interval=5, weather_api_key=None, city=None,
+               sleep_start='23:00', sleep_end='06:00'):
     """
     Start the photo frame server.
     
@@ -190,6 +884,10 @@ def run_server(image_dir, port=8000, interval=5):
         image_dir: Path to directory containing images
         port: Server port (default 8000)
         interval: Seconds between images (default 5)
+        weather_api_key: OpenWeather API key (optional)
+        city: City name for weather display (optional)
+        sleep_start: Sleep mode start time in HH:MM format (default 23:00)
+        sleep_end: Sleep mode end time in HH:MM format (default 06:00)
     """
     # Convert interval to milliseconds for JavaScript
     interval_ms = interval * 1000
@@ -207,11 +905,15 @@ def run_server(image_dir, port=8000, interval=5):
         print("Warning: No images found. Add images to the directory.")
     
     # Create and start the server
-    handler = create_handler(image_dir, interval_ms)
+    handler = create_handler(image_dir, interval_ms, weather_api_key, city, sleep_start, sleep_end)
     server = HTTPServer(('', port), handler)
     
     print(f"Photo Frame Server running at http://localhost:{port}")
     print(f"Slideshow interval: {interval} seconds")
+    if weather_api_key and city:
+        print(f"Weather enabled for: {city}")
+    if sleep_start != sleep_end:
+        print(f"Sleep mode: {sleep_start} to {sleep_end}")
     print("Press Ctrl+C to stop")
     
     try:
