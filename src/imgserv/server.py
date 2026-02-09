@@ -165,12 +165,58 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             align-items: center;
             overflow: hidden;
         }}
-        img {{
+        #photo-pan-wrapper {{
+            position: relative;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: visible;
+        }}
+        #photo-pan-wrapper.pan-active {{
+            overflow: hidden;
+        }}
+        #photo {{
             max-width: 100%;
             max-height: 100vh;
             object-fit: contain;
             position: relative;
             left: 0;
+        }}
+        #photo.pan-active {{
+            position: absolute;
+            width: 108%;
+            height: 108%;
+            max-width: none;
+            max-height: none;
+            left: 50%;
+            top: 50%;
+            object-fit: contain;
+        }}
+        @keyframes panRight {{
+            0% {{ transform: translate(-50%, -50%) translate(0, 0); }}
+            100% {{ transform: translate(-50%, -50%) translate(4%, 0); }}
+        }}
+        @keyframes panLeft {{
+            0% {{ transform: translate(-50%, -50%) translate(0, 0); }}
+            100% {{ transform: translate(-50%, -50%) translate(-4%, 0); }}
+        }}
+        @keyframes panDown {{
+            0% {{ transform: translate(-50%, -50%) translate(0, 0); }}
+            100% {{ transform: translate(-50%, -50%) translate(0, 4%); }}
+        }}
+        @keyframes panUp {{
+            0% {{ transform: translate(-50%, -50%) translate(0, 0); }}
+            100% {{ transform: translate(-50%, -50%) translate(0, -4%); }}
+        }}
+        @keyframes panRightDown {{
+            0% {{ transform: translate(-50%, -50%) translate(0, 0); }}
+            100% {{ transform: translate(-50%, -50%) translate(3%, 3%); }}
+        }}
+        @keyframes panLeftUp {{
+            0% {{ transform: translate(-50%, -50%) translate(0, 0); }}
+            100% {{ transform: translate(-50%, -50%) translate(-3%, -3%); }}
         }}
         .loading {{
             color: #fff;
@@ -271,7 +317,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <div id="sleep-overlay"></div>
     <div id="loading" class="loading">Loading images...</div>
     <div id="photo-container" style="display:none;">
-        <img id="photo" src="" alt="Photo">
+        <div id="photo-pan-wrapper">
+            <img id="photo" src="" alt="Photo">
+        </div>
     </div>
     <div id="clock"></div>
     <div id="weather"></div>
@@ -403,6 +451,16 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         var shuffleIndex = 0;
         var lastServerImages = [];
         var effects = ['fade', 'slideLeft', 'zoomIn', 'flip'];
+        var panDirectionNames = ['panRight', 'panLeft', 'panUp', 'panDown', 'panRightDown', 'panLeftUp'];
+        var panDirectionDeltas = [
+            {{ dx: 4, dy: 0 }}, {{ dx: -4, dy: 0 }}, {{ dx: 0, dy: 4 }}, {{ dx: 0, dy: -4 }},
+            {{ dx: 3, dy: 3 }}, {{ dx: -3, dy: -3 }}
+        ];
+        var panTimer = null;
+        var panStartTime = 0;
+        var panDuration = 0;
+        var panDx = 0;
+        var panDy = 0;
         
         // Helper: Set opacity (cross-browser)
         function setOpacity(element, value) {{
@@ -441,6 +499,77 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         // Get random effect
         function getRandomEffect() {{
             return effects[Math.floor(Math.random() * effects.length)];
+        }}
+        
+        function addClass(el, name) {{
+            if (el.classList) {{ el.classList.add(name); }}
+            else {{ el.className = (el.className + ' ' + name).replace(/\\s+/g, ' ').replace(/^\\s|\\s$/g, ''); }}
+        }}
+        function removeClass(el, name) {{
+            if (el.classList) {{ el.classList.remove(name); }}
+            else {{ el.className = el.className.replace(new RegExp('\\\\\\\\b' + name + '\\\\\\\\b', 'g'), '').replace(/\\s+/g, ' ').replace(/^\\s|\\s$/g, ''); }}
+        }}
+        function hasAnimationSupport() {{
+            var s = document.documentElement.style;
+            return typeof s.animation !== 'undefined' || typeof s.webkitAnimation !== 'undefined' || typeof s.MozAnimation !== 'undefined';
+        }}
+        function runPanStep() {{
+            var photo = document.getElementById('photo');
+            if (!photo || !panDuration) return;
+            var elapsed = (new Date().getTime()) - panStartTime;
+            var t = elapsed >= panDuration ? 1 : elapsed / panDuration;
+            var left = 50 + panDx * t;
+            var top = 50 + panDy * t;
+            photo.style.left = left + '%';
+            photo.style.top = top + '%';
+            if (t >= 1) clearInterval(panTimer);
+        }}
+        // Start gradual pan (Ken Burns style) - runs while image is visible, no zoom. IE8: uses left/top animation.
+        function startPan() {{
+            var photo = document.getElementById('photo');
+            var wrapper = document.getElementById('photo-pan-wrapper');
+            photo.style.left = '';
+            photo.style.width = '';
+            photo.style.top = '';
+            var idx = Math.floor(Math.random() * panDirectionNames.length);
+            var name = panDirectionNames[idx];
+            var d = panDirectionDeltas[idx];
+            addClass(wrapper, 'pan-active');
+            addClass(photo, 'pan-active');
+            addClass(photo, name);
+            if (hasAnimationSupport()) {{
+                photo.style.animation = name + ' ' + (interval / 1000) + 's linear forwards';
+            }} else {{
+                photo.style.marginLeft = '-54%';
+                photo.style.marginTop = '-54%';
+                photo.style.left = '50%';
+                photo.style.top = '50%';
+                panStartTime = new Date().getTime();
+                panDuration = interval;
+                panDx = d.dx;
+                panDy = d.dy;
+                if (panTimer) clearInterval(panTimer);
+                panTimer = setInterval(runPanStep, 50);
+            }}
+        }}
+        // Stop pan before transitioning to next image
+        function stopPan() {{
+            var photo = document.getElementById('photo');
+            var wrapper = document.getElementById('photo-pan-wrapper');
+            if (panTimer) {{ clearInterval(panTimer); panTimer = null; }}
+            photo.style.animation = '';
+            photo.style.transform = '';
+            photo.style.left = '';
+            photo.style.top = '';
+            photo.style.marginLeft = '';
+            photo.style.marginTop = '';
+            var i, d;
+            for (i = 0; i < panDirectionNames.length; i++) {{
+                d = panDirectionNames[i];
+                removeClass(photo, d);
+            }}
+            removeClass(photo, 'pan-active');
+            removeClass(wrapper, 'pan-active');
         }}
         
         // Effect: Fade Out
@@ -590,6 +719,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         
         // Apply transition out based on effect type
         function transitionOut(element, effect, callback) {{
+            stopPan();
             if (effect === 'fade') {{
                 fadeOut(element, callback);
             }} else if (effect === 'slideLeft') {{
@@ -605,16 +735,20 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         
         // Apply transition in based on effect type
         function transitionIn(element, effect, callback) {{
+            var wrappedCallback = callback ? function() {{
+                if (callback) callback();
+                startPan();
+            }} : function() {{ startPan(); }};
             if (effect === 'fade') {{
-                fadeIn(element, callback);
+                fadeIn(element, wrappedCallback);
             }} else if (effect === 'slideLeft') {{
-                slideLeftIn(element, callback);
+                slideLeftIn(element, wrappedCallback);
             }} else if (effect === 'zoomIn') {{
-                zoomIn(element, callback);
+                zoomIn(element, wrappedCallback);
             }} else if (effect === 'flip') {{
-                flipIn(element, callback);
+                flipIn(element, wrappedCallback);
             }} else {{
-                fadeIn(element, callback);
+                fadeIn(element, wrappedCallback);
             }}
         }}
         
