@@ -283,10 +283,35 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             display: none;
         }}
         .sleep-mode #clock {{
-            opacity: 0.3;
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            bottom: auto;
+            transform: translate(-50%, -50%);
+            font-size: 144px;
+            color: #9a9a9a;
+            opacity: 1;
+            z-index: 1001;
+            text-align: center;
         }}
         .sleep-mode #weather {{
-            display: none;
+            position: fixed;
+            top: calc(50% + 125px);
+            left: 50%;
+            bottom: auto;
+            transform: translateX(-50%);
+            display: flex;
+            justify-content: center;
+            font-size: 42px;
+            color: #8f8f8f;
+            z-index: 1001;
+            text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.7);
+        }}
+        .sleep-mode #weather img {{
+            width: 52px;
+            height: 52px;
+            margin-right: 8px;
+            filter: grayscale(100%) brightness(0.65);
         }}
         .sleep-mode #photo-metadata {{
             display: none;
