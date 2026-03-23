@@ -8,14 +8,21 @@ import os
 import json
 import mimetypes
 import time
+import ssl
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import unquote, quote
 try:
-    from urllib.request import urlopen
+    from urllib.request import urlopen, Request
     from urllib.error import URLError
 except ImportError:
-    from urllib2 import urlopen, URLError
+    from urllib2 import urlopen, URLError, Request
+
+# Optional CA bundle fallback for macOS/python.org installs
+try:
+    import certifi
+except ImportError:
+    certifi = None
 
 # Try to import Pillow for EXIF reading
 try:
@@ -34,9 +41,27 @@ weather_cache = {
     'timestamp': 0
 }
 WEATHER_CACHE_DURATION = 600  # 10 minutes in seconds
+weather_last_error = None
 
 # Metadata cache (to avoid re-reading EXIF for same image)
 metadata_cache = {}
+
+
+def safe_urlopen(url, timeout, headers=None):
+    """Open URLs with default TLS verification and certifi fallback."""
+    request_obj = Request(url, headers=headers or {}) if headers else url
+    try:
+        return urlopen(request_obj, timeout=timeout)
+    except Exception as e:
+        # If certificate validation fails and certifi exists, retry with its CA bundle.
+        if certifi and "CERTIFICATE_VERIFY_FAILED" in str(e):
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            try:
+                return urlopen(request_obj, timeout=timeout, context=ssl_context)
+            except TypeError:
+                # Python 2 urllib2 doesn't support SSL context argument.
+                pass
+        raise
 
 
 def convert_gps_to_decimal(gps_coords, gps_ref):
@@ -59,8 +84,15 @@ def convert_gps_to_decimal(gps_coords, gps_ref):
 def reverse_geocode(lat, lon):
     """Reverse geocode coordinates to location name using OpenStreetMap Nominatim."""
     try:
-        url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}&zoom=10"
-        response = urlopen(url, timeout=5)
+        url = (
+            "https://nominatim.openstreetmap.org/reverse"
+            f"?format=jsonv2&lat={lat}&lon={lon}&zoom=10&addressdetails=1"
+        )
+        headers = {
+            "User-Agent": "imgserv/0.1 (+https://localhost)",
+            "Accept-Language": "en"
+        }
+        response = safe_urlopen(url, timeout=5, headers=headers)
         data = json.loads(response.read().decode('utf-8'))
         
         address = data.get('address', {})
@@ -707,18 +739,19 @@ def get_image_files(directory):
 
 def fetch_weather(api_key, city):
     """Fetch weather data from OpenWeather API with caching."""
-    global weather_cache
+    global weather_cache, weather_last_error
     
     # Check cache
     current_time = time.time()
     if weather_cache['data'] and (current_time - weather_cache['timestamp']) < WEATHER_CACHE_DURATION:
+        weather_last_error = None
         return weather_cache['data']
     
     # Fetch from API
     try:
         encoded_city = quote(city)
         url = f"https://api.openweathermap.org/data/2.5/weather?q={encoded_city}&appid={api_key}&units=imperial"
-        response = urlopen(url, timeout=10)
+        response = safe_urlopen(url, timeout=10)
         data = json.loads(response.read().decode('utf-8'))
         
         # Extract relevant data
@@ -732,10 +765,13 @@ def fetch_weather(api_key, city):
         # Update cache
         weather_cache['data'] = weather_data
         weather_cache['timestamp'] = current_time
+        weather_last_error = None
         
         return weather_data
     except Exception as e:
-        print(f"Weather API error: {e}")
+        error_message = str(e)
+        weather_last_error = error_message
+        print(f"Weather API error: {error_message}")
         # Return cached data if available, even if expired
         if weather_cache['data']:
             return weather_cache['data']
@@ -798,7 +834,11 @@ def create_handler(image_dir, interval_ms, weather_api_key=None, city=None, slee
         def serve_weather(self):
             """Serve current weather data as JSON."""
             if not weather_api_key or not city:
-                content = json.dumps({'error': 'Weather not configured'}).encode('utf-8')
+                content = json.dumps({
+                    'error': 'Weather not configured',
+                    'code': 'weather_not_configured',
+                    'message': 'Set OPENWEATHER_API_KEY and --city to enable weather.'
+                }).encode('utf-8')
                 self.send_response_headers(200, 'application/json', len(content))
                 self.wfile.write(content)
                 return
@@ -809,7 +849,18 @@ def create_handler(image_dir, interval_ms, weather_api_key=None, city=None, slee
                 self.send_response_headers(200, 'application/json', len(content))
                 self.wfile.write(content)
             else:
-                content = json.dumps({'error': 'Failed to fetch weather'}).encode('utf-8')
+                details = weather_last_error or 'Unknown upstream error'
+                hint = None
+                if 'CERTIFICATE_VERIFY_FAILED' in details:
+                    hint = 'TLS certificate validation failed. Install system/ Python CA certificates or use certifi.'
+
+                content = json.dumps({
+                    'error': 'Failed to fetch weather',
+                    'code': 'weather_fetch_failed',
+                    'message': 'Could not retrieve weather from OpenWeather.',
+                    'details': details,
+                    'hint': hint
+                }).encode('utf-8')
                 self.send_response_headers(500, 'application/json', len(content))
                 self.wfile.write(content)
         
