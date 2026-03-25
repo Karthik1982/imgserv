@@ -459,7 +459,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         var shuffledImages = [];
         var shuffleIndex = 0;
         var lastServerImages = [];
+        var isLegacyIE = !!(document.documentMode && document.documentMode < 9) ||
+            /MSIE [1-8]\./.test(navigator.userAgent);
         var effects = ['fade', 'slideLeft', 'zoomIn', 'flip'];
+        if (isLegacyIE) {{
+            // IE8 is flaky with width/position-heavy transitions and cached image onload events.
+            effects = ['fade'];
+        }}
         
         // Helper: Set opacity (cross-browser)
         function setOpacity(element, value) {{
@@ -498,6 +504,50 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         // Get random effect
         function getRandomEffect() {{
             return effects[Math.floor(Math.random() * effects.length)];
+        }}
+
+        function resetPhotoStyles(photo) {{
+            photo.style.left = '0';
+            photo.style.width = '';
+            setOpacity(photo, 100);
+        }}
+
+        function loadImageRobust(photo, src, onReady) {{
+            var finished = false;
+            var timeoutMs = isLegacyIE ? 6000 : 4000;
+            var timer = setTimeout(function() {{
+                if (finished) return;
+                finished = true;
+                photo.onload = null;
+                photo.onerror = null;
+                photo.onreadystatechange = null;
+                onReady(false);
+            }}, timeoutMs);
+
+            function done(success) {{
+                if (finished) return;
+                finished = true;
+                clearTimeout(timer);
+                photo.onload = null;
+                photo.onerror = null;
+                photo.onreadystatechange = null;
+                onReady(success);
+            }}
+
+            photo.onload = function() {{
+                done(true);
+            }};
+            photo.onerror = function() {{
+                done(false);
+            }};
+            photo.onreadystatechange = function() {{
+                if (photo.readyState === 'loaded' || photo.readyState === 'complete') {{
+                    done(true);
+                }}
+            }};
+
+            // Ensure event handlers are attached before src changes.
+            photo.src = src;
         }}
         
         // Effect: Fade Out
@@ -697,45 +747,76 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         
         function fetchAndShow() {{
             var xhr = new XMLHttpRequest();
+            var nextScheduled = false;
+            function scheduleNext(delay) {{
+                if (nextScheduled) return;
+                nextScheduled = true;
+                setTimeout(fetchAndShow, delay || interval);
+            }}
+
             xhr.open('GET', '/api/images', true);
+            xhr.timeout = 10000;
             xhr.onreadystatechange = function() {{
-                if (xhr.readyState === 4 && xhr.status === 200) {{
-                    var images = JSON.parse(xhr.responseText);
-                    if (images.length > 0) {{
-                        document.getElementById('loading').style.display = 'none';
-                        var container = document.getElementById('photo-container');
-                        var photo = document.getElementById('photo');
-                        container.style.display = 'flex';
-                        
-                        var nextImage = getNextImage(images);
-                        var effect = getRandomEffect();
-                        
-                        if (isFirstImage) {{
-                            setOpacity(photo, 0);
-                            photo.onload = function() {{
-                                transitionIn(photo, effect);
-                            }};
-                            photo.src = '/image/' + encodeURIComponent(nextImage);
-                            updateMetadata(nextImage);
-                            isFirstImage = false;
-                            setTimeout(fetchAndShow, interval);
-                        }} else {{
-                            transitionOut(photo, effect, function() {{
-                                photo.onload = function() {{
-                                    transitionIn(photo, effect);
-                                }};
-                                photo.src = '/image/' + encodeURIComponent(nextImage);
+                if (xhr.readyState !== 4) return;
+
+                if (xhr.status === 200) {{
+                    try {{
+                        var images = JSON.parse(xhr.responseText);
+                        if (images.length > 0) {{
+                            document.getElementById('loading').style.display = 'none';
+                            var container = document.getElementById('photo-container');
+                            var photo = document.getElementById('photo');
+                            container.style.display = 'flex';
+                            
+                            var nextImage = getNextImage(images);
+                            var effect = getRandomEffect();
+                            
+                            if (isFirstImage) {{
+                                setOpacity(photo, 0);
+                                resetPhotoStyles(photo);
+                                loadImageRobust(photo, '/image/' + encodeURIComponent(nextImage), function(success) {{
+                                    if (success) {{
+                                        transitionIn(photo, effect);
+                                    }} else {{
+                                        // Fall back to visible image state even if load signaling is flaky.
+                                        setOpacity(photo, 100);
+                                    }}
+                                }});
                                 updateMetadata(nextImage);
-                                setTimeout(fetchAndShow, interval);
-                            }});
+                                isFirstImage = false;
+                                scheduleNext(interval);
+                            }} else {{
+                                transitionOut(photo, effect, function() {{
+                                    resetPhotoStyles(photo);
+                                    loadImageRobust(photo, '/image/' + encodeURIComponent(nextImage), function(success) {{
+                                        if (success) {{
+                                            transitionIn(photo, effect);
+                                        }} else {{
+                                            setOpacity(photo, 100);
+                                        }}
+                                    }});
+                                    updateMetadata(nextImage);
+                                    scheduleNext(interval);
+                                }});
+                            }}
+                        }} else {{
+                            document.getElementById('loading').style.display = 'block';
+                            document.getElementById('photo-container').style.display = 'none';
+                            document.getElementById('loading').innerHTML = 'No images found';
+                            scheduleNext(interval);
                         }}
-                    }} else {{
-                        document.getElementById('loading').style.display = 'block';
-                        document.getElementById('photo-container').style.display = 'none';
-                        document.getElementById('loading').innerHTML = 'No images found';
-                        setTimeout(fetchAndShow, interval);
+                    }} catch (e) {{
+                        scheduleNext(3000);
                     }}
+                }} else {{
+                    scheduleNext(3000);
                 }}
+            }};
+            xhr.onerror = function() {{
+                scheduleNext(3000);
+            }};
+            xhr.ontimeout = function() {{
+                scheduleNext(3000);
             }};
             xhr.send();
         }}
