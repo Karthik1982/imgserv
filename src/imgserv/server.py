@@ -461,11 +461,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         var lastServerImages = [];
         var isLegacyIE = !!(document.documentMode && document.documentMode < 9) ||
             /MSIE [1-8]\./.test(navigator.userAgent);
-        var effects = ['fade', 'slideLeft', 'zoomIn', 'flip'];
-        if (isLegacyIE) {{
-            // IE8 is flaky with width/position-heavy transitions and cached image onload events.
-            effects = ['fade'];
-        }}
+        var effects = ['fade'];
         
         // Helper: Set opacity (cross-browser)
         function setOpacity(element, value) {{
@@ -509,7 +505,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         function resetPhotoStyles(photo) {{
             photo.style.left = '0';
             photo.style.width = '';
-            setOpacity(photo, 100);
         }}
 
         function loadImageRobust(photo, src, onReady) {{
