@@ -27,10 +27,11 @@ except ImportError:
 # Try to import Pillow for EXIF reading
 try:
     from PIL import Image
-    from PIL.ExifTags import TAGS, GPSTAGS
+    from PIL.ExifTags import TAGS, GPSTAGS, IFD
     PILLOW_AVAILABLE = True
 except ImportError:
     PILLOW_AVAILABLE = False
+    IFD = None  # unused when Pillow is missing
 
 # HEIC/HEIF decoding for Pillow (optional but required for EXIF on those files)
 try:
@@ -62,34 +63,64 @@ metadata_cache = {}
 
 
 def safe_urlopen(url, timeout, headers=None):
-    """Open URLs with default TLS verification and certifi fallback."""
+    """Open URLs with TLS verification; prefer certifi's CA bundle when available."""
     request_obj = Request(url, headers=headers or {}) if headers else url
+    if certifi:
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        return urlopen(request_obj, timeout=timeout, context=ssl_context)
+    return urlopen(request_obj, timeout=timeout)
+
+
+def _to_float_exif_rational(value):
+    """Convert EXIF GPS rationals (IFDRational, tuple, int, float) to float."""
+    if value is None:
+        return None
+    if isinstance(value, (float, int)) and not isinstance(value, bool):
+        return float(value)
     try:
-        return urlopen(request_obj, timeout=timeout)
-    except Exception as e:
-        # If certificate validation fails and certifi exists, retry with its CA bundle.
-        if certifi and "CERTIFICATE_VERIFY_FAILED" in str(e):
-            ssl_context = ssl.create_default_context(cafile=certifi.where())
-            try:
-                return urlopen(request_obj, timeout=timeout, context=ssl_context)
-            except TypeError:
-                # Python 2 urllib2 doesn't support SSL context argument.
-                pass
-        raise
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+    if hasattr(value, 'numerator') and hasattr(value, 'denominator'):
+        n, d = value.numerator, value.denominator
+        return float(n) / float(d) if d else float(n)
+    if isinstance(value, (tuple, list)):
+        if len(value) == 2:
+            a = _to_float_exif_rational(value[0])
+            b = _to_float_exif_rational(value[1])
+            if a is not None and b is not None and b != 0:
+                return a / b
+        if len(value) == 1:
+            return _to_float_exif_rational(value[0])
+    return None
+
+
+def _normalize_gps_ref(gps_ref):
+    if gps_ref is None:
+        return None
+    if isinstance(gps_ref, bytes):
+        gps_ref = gps_ref.decode('latin-1', errors='replace')
+    s = str(gps_ref).strip().upper()
+    return s[0] if s else None
 
 
 def convert_gps_to_decimal(gps_coords, gps_ref):
     """Convert GPS coordinates from EXIF format to decimal degrees."""
     try:
-        degrees = float(gps_coords[0])
-        minutes = float(gps_coords[1])
-        seconds = float(gps_coords[2])
-        
+        if not gps_coords or len(gps_coords) < 3:
+            return None
+        degrees = _to_float_exif_rational(gps_coords[0])
+        minutes = _to_float_exif_rational(gps_coords[1])
+        seconds = _to_float_exif_rational(gps_coords[2])
+        if degrees is None or minutes is None or seconds is None:
+            return None
+
         decimal = degrees + (minutes / 60.0) + (seconds / 3600.0)
-        
-        if gps_ref in ['S', 'W']:
+
+        ref = _normalize_gps_ref(gps_ref)
+        if ref in ('S', 'W'):
             decimal = -decimal
-        
+
         return decimal
     except (TypeError, IndexError, ValueError):
         return None
@@ -103,7 +134,8 @@ def reverse_geocode(lat, lon):
             f"?format=jsonv2&lat={lat}&lon={lon}&zoom=10&addressdetails=1"
         )
         headers = {
-            "User-Agent": "imgserv/0.1 (+https://localhost)",
+            # Nominatim requires an identifying User-Agent (application name).
+            "User-Agent": "imgserv/0.1 (self-hosted photo frame)",
             "Accept-Language": "en"
         }
         response = safe_urlopen(url, timeout=5, headers=headers)
@@ -143,38 +175,60 @@ def get_exif_data(filepath):
     
     try:
         img = Image.open(filepath)
-        exif_data = img._getexif()
-        
-        if exif_data:
-            # Extract date taken (tag 36867 = DateTimeOriginal)
-            date_taken = exif_data.get(36867)
-            if date_taken:
+        date_taken = None
+        gps_info = None
+
+        # Modern Pillow + HEIC/iPhone: GPS lives in getexif() IFDs; _getexif() is often empty.
+        try:
+            exif = img.getexif()
+            if exif:
                 try:
-                    # Parse EXIF date format "YYYY:MM:DD HH:MM:SS"
-                    dt = datetime.strptime(date_taken, "%Y:%m:%d %H:%M:%S")
-                    result['date'] = dt.strftime("%B %d, %Y")  # "January 15, 2024"
-                except ValueError:
-                    result['date'] = date_taken
-            
-            # Extract GPS info (tag 34853 = GPSInfo)
-            gps_info = exif_data.get(34853)
-            if gps_info:
-                lat = None
-                lon = None
-                
-                # GPS tags: 1=LatitudeRef, 2=Latitude, 3=LongitudeRef, 4=Longitude
-                lat_ref = gps_info.get(1)
-                lat_coords = gps_info.get(2)
-                lon_ref = gps_info.get(3)
-                lon_coords = gps_info.get(4)
-                
-                if lat_coords and lon_coords:
-                    lat = convert_gps_to_decimal(lat_coords, lat_ref)
-                    lon = convert_gps_to_decimal(lon_coords, lon_ref)
-                
-                if lat is not None and lon is not None:
-                    result['location'] = reverse_geocode(lat, lon)
-        
+                    exif_ifd = exif.get_ifd(IFD.Exif)
+                    if exif_ifd:
+                        date_taken = exif_ifd.get(36867)
+                except Exception:
+                    pass
+                if not date_taken:
+                    date_taken = exif.get(36867)
+                try:
+                    gps_info = exif.get_ifd(IFD.GPSInfo)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if date_taken is None or not gps_info:
+            legacy = getattr(img, '_getexif', None)
+            legacy_exif = legacy() if legacy else None
+            if legacy_exif:
+                if date_taken is None:
+                    date_taken = legacy_exif.get(36867)
+                if not gps_info:
+                    gps_info = legacy_exif.get(34853)
+
+        if date_taken:
+            if isinstance(date_taken, bytes):
+                date_taken = date_taken.decode('utf-8', errors='replace')
+            try:
+                dt = datetime.strptime(date_taken, "%Y:%m:%d %H:%M:%S")
+                result['date'] = dt.strftime("%B %d, %Y")
+            except ValueError:
+                result['date'] = str(date_taken)
+
+        if gps_info:
+            lat_ref = gps_info.get(1)
+            lat_coords = gps_info.get(2)
+            lon_ref = gps_info.get(3)
+            lon_coords = gps_info.get(4)
+
+            lat = lon = None
+            if lat_coords and lon_coords:
+                lat = convert_gps_to_decimal(lat_coords, lat_ref)
+                lon = convert_gps_to_decimal(lon_coords, lon_ref)
+
+            if lat is not None and lon is not None:
+                result['location'] = reverse_geocode(lat, lon)
+
         img.close()
     except Exception as e:
         print(f"Error reading EXIF from {filepath}: {e}")
