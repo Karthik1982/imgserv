@@ -32,8 +32,22 @@ try:
 except ImportError:
     PILLOW_AVAILABLE = False
 
+# HEIC/HEIF decoding for Pillow (optional but required for EXIF on those files)
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except ImportError:
+    pass
+
+mimetypes.add_type('image/heic', '.heic')
+mimetypes.add_type('image/heif', '.heif')
+
 # Supported image extensions
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
+IMAGE_EXTENSIONS = {
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp',
+    '.heic', '.heif',
+}
 
 # Weather cache (to avoid excessive API calls)
 weather_cache = {

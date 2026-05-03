@@ -16,6 +16,7 @@ a = Analysis(
         'imgserv',
         'imgserv.server',
         'imgserv.__main__',
+        'pillow_heif',
     ],
     hookspath=[],
     hooksconfig={},
