@@ -16,6 +16,31 @@ It also supports:
 - Shows current weather with icon and temperature when configured
 - Includes configurable sleep window (for overnight display pause)
 
+## Use cases and browser compatibility
+
+### Turn an old iPad (or any tablet) into a photo frame
+
+The slideshow is just a **web page** served over HTTP. A common setup:
+
+1. Run `imgserv` on a **Raspberry Pi**, **other single-board computer**, **home server**, **NAS**, or even a small **cloud VM**—anywhere you can keep a folder of photos and run Python.
+2. Drop new images into that folder on the server (or sync them with your usual tools). The iPad does not need your full photo library or iCloud; it only needs **Safari** (or another browser) on the same LAN (or VPN).
+3. On the iPad, open `http://<server-hostname-or-ip>:8000/` (change the port if you use `--port`). For a living-room frame, use **full-screen** browsing and optionally **Guided Access** (Settings → Accessibility) so taps don’t exit the slideshow.
+
+That split—**heavy lifting and storage on a small computer**, **display on a thin client**—is easy on the tablet’s battery and storage, and it avoids relying on the iPad staying on a specific iOS version for “frame” apps.
+
+### Why this stack is a good match for older devices
+
+- **Small server footprint**: one Python process, standard library HTTP server, optional weather calls. It runs comfortably on a Pi or an old PC with no desktop environment.
+- **No vendor lock-in**: your photos stay as files on disk; you are not tied to a subscription gallery or a single manufacturer’s frame app.
+- **Simple client**: the UI is plain **HTML, CSS, and JavaScript** (slideshow, `XMLHttpRequest` for `/api/...`, `<img>` tags). There is no SPA framework, no build step in the browser, and no requirement for WebSockets or bleeding-edge APIs—so **older Mobile Safari and other WebKit-based browsers** tend to behave better than with many modern gallery front ends.
+
+### Image formats and “old browser” reality
+
+For **maximum compatibility** with random old browsers or non-Apple tablets, prefer **JPEG** and **PNG** in the photo directory.
+
+- **WebP** is widely supported on current Mobile Safari (about **iOS 14+**). Very old iPads stuck on earlier iOS may not render WebP in `<img>`; use JPEG/PNG there.
+- **HEIC / HEIF** (common for iPhone photos) is handled well by **Safari on Apple devices**, so an old iPad running a reasonably recent iOS can often show those files directly. **Many desktop browsers (e.g. Chrome, Firefox on Windows/Linux)** still do not display HEIC inside `<img>`. If your frame uses one of those, convert HEIC to JPEG on the server side or keep a JPEG copy in the folder.
+
 ## Requirements
 
 - Python 3.11+
@@ -194,6 +219,5 @@ Point Chromium or your fullscreen browser at `http://127.0.0.1:8000` (or the hos
 
 ## Notes
 
-- HEIC/HEIF support requires the `pillow-heif` dependency (already included in this project).
-- Browser support for rendering HEIC directly may vary by browser/OS.
+- HEIC/HEIF support requires the `pillow-heif` dependency (already included in this project). See **Use cases and browser compatibility** for which clients display HEIC well.
 - If no images are found, the server still starts and waits for files to be added.
